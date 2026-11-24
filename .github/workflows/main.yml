@@ -1,0 +1,61 @@
+name: Update Get ReKt420 Discord Status
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: get-rekt420-discord-tracker
+  cancel-in-progress: false
+
+jobs:
+  update-discord:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install tracker dependencies
+        run: |
+          python -m pip install --quiet requests playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Update Discord status card
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -f "wf_status_cloud.py" ]; then
+            python wf_status_cloud.py
+          elif [ -f "UPLOAD_INSIDE_TO_GITHUB/wf_status_cloud.py" ]; then
+            python UPLOAD_INSIDE_TO_GITHUB/wf_status_cloud.py
+          else
+            echo "ERROR: wf_status_cloud.py is missing from this repo."
+            exit 1
+          fi
+
+      - name: Save Discord message ID and keep schedule active
+        run: |
+          LAST_COMMIT=$(git log -1 --format=%ct 2>/dev/null || echo 0)
+          NOW=$(date +%s)
+          AGE=$((NOW - LAST_COMMIT))
+          if [ "$AGE" -gt 3888000 ]; then
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > heartbeat.txt
+          fi
+          if [ -n "$(git status --porcelain)" ]; then
+            git config user.name "Get ReKt420 Bot"
+            git config user.email "bot@users.noreply.github.com"
+            git add -A
+            git commit -m "Update tracker state"
+            git pull --rebase
+            git push
+          fi
