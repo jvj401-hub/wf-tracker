@@ -1326,8 +1326,6 @@ def build_roster_html(players: list) -> str:
                 rank_cls = "rank-std"
 
             raw_name = str(p.get("name") or "").strip()
-            if len(raw_name) > 22:
-                raw_name = raw_name[:21] + "…"
             safe_name = html.escape(raw_name)
             sess = html.escape(format_session_time(p.get("session")))
             tot = html.escape(format_total_time(p.get("total")))
@@ -1352,10 +1350,10 @@ def build_roster_html(players: list) -> str:
     background: #2b2d31;
     font-family: 'Liberation Sans', 'DejaVu Sans', Arial, sans-serif;
     color: #ffffff;
-    width: 560px;
+    width: 420px;
   }}
   #roster-card {{
-    width: 560px;
+    width: 420px;
     background: #1e1f22;
     border: 1px solid #383a40;
     border-radius: 8px;
@@ -1364,23 +1362,23 @@ def build_roster_html(players: list) -> str:
   .header {{
     display: flex;
     align-items: center;
-    padding: 9px 14px;
+    padding: 8px 8px;
     background: #17181b;
     border-bottom: 1px solid #32343a;
-    font-family: 'Liberation Mono', 'DejaVu Sans Mono', monospace;
-    font-size: 12px;
+    font-family: 'Liberation Sans', 'DejaVu Sans', Arial, sans-serif;
+    font-size: 13.5px;
     font-weight: 700;
-    letter-spacing: 0.5px;
-    color: #b5bac1;
+    letter-spacing: 0.3px;
+    color: #dcdfe4;
     text-transform: uppercase;
   }}
   .row {{
     display: flex;
     align-items: center;
-    padding: 6px 14px;
+    padding: 5px 8px;
     border-bottom: 1px solid #26282d;
-    font-size: 14px;
-    line-height: 1.25;
+    font-size: 18px;
+    line-height: 1.2;
   }}
   .row:nth-child(even) {{
     background: #222428;
@@ -1389,18 +1387,19 @@ def build_roster_html(players: list) -> str:
     border-bottom: none;
   }}
   .col-rank {{
-    width: 58px;
+    width: 48px;
     flex-shrink: 0;
     font-family: 'Liberation Mono', 'DejaVu Sans Mono', monospace;
-    font-size: 13px;
+    font-size: 15px;
     font-weight: 700;
   }}
   .badge {{
     display: inline-block;
-    min-width: 40px;
+    min-width: 42px;
     text-align: center;
-    padding: 2px 5px;
+    padding: 2px 3px;
     border-radius: 4px;
+    letter-spacing: -0.5px;
   }}
   .rank-1 {{
     color: #f5c542;
@@ -1425,36 +1424,52 @@ def build_roster_html(players: list) -> str:
   .col-name {{
     flex: 1;
     min-width: 0;
-    padding-right: 10px;
-    font-weight: 600;
+    padding-right: 6px;
+    font-size: 18px;
+    font-weight: 700;
     color: #ffffff;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }}
   .col-sess {{
+    width: 86px;
+    flex-shrink: 0;
+    text-align: right;
+    font-family: 'Liberation Mono', 'DejaVu Sans Mono', monospace;
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    color: #ffffff;
+    font-variant-numeric: tabular-nums;
+  }}
+  .col-tot {{
     width: 96px;
     flex-shrink: 0;
     text-align: right;
     font-family: 'Liberation Mono', 'DejaVu Sans Mono', monospace;
-    font-size: 13.5px;
-    font-weight: 600;
+    font-size: 17px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
     color: #ffffff;
+    font-variant-numeric: tabular-nums;
   }}
-  .col-tot {{
-    width: 106px;
-    flex-shrink: 0;
-    text-align: right;
-    font-family: 'Liberation Mono', 'DejaVu Sans Mono', monospace;
+  .header .col-rank,
+  .header .col-name,
+  .header .col-sess,
+  .header .col-tot {{
+    font-family: 'Liberation Sans', 'DejaVu Sans', Arial, sans-serif;
     font-size: 13.5px;
-    font-weight: 600;
-    color: #ffffff;
+    font-weight: 700;
+    letter-spacing: 0.3px;
+    color: #dcdfe4;
   }}
   .empty-row {{
-    padding: 18px 14px;
+    padding: 20px 10px;
     text-align: center;
-    color: #b5bac1;
-    font-size: 14px;
+    color: #dcdfe4;
+    font-size: 17px;
+    font-weight: 600;
   }}
 </style>
 </head>
@@ -1476,7 +1491,7 @@ async def render_roster_png_async(browser, players: list, out_path: str) -> bool
     """Render a crisp 2x retina PNG table so Desktop and Mobile Discord look identical."""
     try:
         ctx = await browser.new_context(
-            viewport={"width": 600, "height": 1200},
+            viewport={"width": 460, "height": 1400},
             device_scale_factor=2,
         )
         page = await ctx.new_page()
@@ -1529,7 +1544,7 @@ def build_embed(info: dict, thumbnail_url: str = THUMBNAIL_URL, use_image: bool 
         status_line = f"🟠 Online (Empty) — 0 / {maximum} Players"
         bar = make_progress_bar(0, maximum)
 
-    roster_heading = f"**Active Players ({current}/{maximum})**" if maximum else f"**Active Players ({current})**"
+    roster_heading = f"### Active Players ({current}/{maximum})" if maximum else f"### Active Players ({current})"
 
     desc_parts = [f"**{status_line}**"]
     if bar:
