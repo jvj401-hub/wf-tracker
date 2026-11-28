@@ -64,6 +64,11 @@ def normalize_name(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", (text or "").lower())
 
 
+def extract_server_id(url: str):
+    m = re.search(r"[?&]id=(\d+)", url or "")
+    return m.group(1) if m else None
+
+
 def make_progress_bar(current: int, maximum: int, length: int = 16) -> str:
     if not maximum or maximum <= 0:
         return ""
@@ -83,6 +88,15 @@ def pick_working_thumbnail() -> str:
     return THUMBNAIL_CANDIDATES[0]
 
 
+def strip_date_timestamps(text: str) -> str:
+    """Remove Last Active date/clock timestamps like '11/19/2025, 1:46:27 PM' so only durations remain."""
+    s = text or ""
+    s = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}(?:,?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)?", " ", s, flags=re.I)
+    s = re.sub(r"\b\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?", " ", s, flags=re.I)
+    s = re.sub(r"\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)\b", " ", s, flags=re.I)
+    return s
+
+
 def parse_duration_seconds(val):
     if val is None or isinstance(val, bool):
         return None
@@ -99,7 +113,6 @@ def parse_duration_seconds(val):
     m = re.match(r"^(\d+):(\d{2})$", s)
     if m:
         return int(m.group(1)) * 3600 + int(m.group(2)) * 60
-    # Text like "103 hrs", "18.5h", "2d 4h 10m", "45m"
     total = 0.0
     matched = False
     for num, unit in re.findall(
@@ -230,35 +243,18 @@ def extract_players_from_list(items) -> list:
                     session_val = convert_numeric_duration_by_key(key, pmap[key])
                     break
 
+            # Only grab explicitly server-scoped totals from server.html JSON (never global totals)
             total_val = None
-            total_keys = (
-                "total", "total_duration", "totalduration", "total_time", "totaltime",
-                "total_seconds", "totalseconds", "total_sec", "totalsec",
-                "total_duration_seconds", "totaldurationseconds", "total_time_seconds",
-                "total_hours", "totalhours", "total_minutes", "totalminutes", "total_ms", "totalms",
-                "server_duration", "serverduration", "server_time", "servertime",
-                "server_seconds", "serverseconds", "server_hours", "serverhours",
-                "cumulative", "cumulative_duration", "cumulative_seconds", "cumulative_hours",
-                "all_time", "alltime", "all_time_duration", "alltimeduration",
-                "overall_duration", "overallduration", "lifetime", "lifetime_duration",
-                "total_playtime", "totalplaytime", "playtime", "hours",
+            server_total_keys = (
+                "server_duration", "serverduration", "server_duration_seconds", "server_time",
+                "servertime", "server_seconds", "serverseconds", "server_hours", "serverhours",
+                "total_on_server", "total_server_duration", "total_duration", "totalduration",
+                "total_seconds", "totalseconds", "total_hours", "totalhours", "total",
             )
-            for key in total_keys:
+            for key in server_total_keys:
                 if key in pmap and pmap[key] is not None:
                     total_val = convert_numeric_duration_by_key(key, pmap[key])
                     break
-
-            # Fuzzy fallback for any key mentioning total/cumulative/overall/alltime + time/dur/sec/hour
-            if total_val is None:
-                for key, val in pmap.items():
-                    if val is None or isinstance(val, (dict, list, bool)):
-                        continue
-                    if any(tok in key for tok in ("total", "cumul", "overall", "alltime", "all_time", "lifetime")):
-                        if any(tok in key for tok in ("dur", "time", "sec", "hour", "hr", "min", "play")):
-                            cand = convert_numeric_duration_by_key(key, val)
-                            if cand is not None:
-                                total_val = cand
-                                break
 
             entries.append({"name": name, "href": None, "session": session_val, "total": total_val})
     return dedupe_player_entries(entries)
@@ -305,42 +301,8 @@ def extract_active_players_from_json(payloads) -> list:
     return []
 
 
-def collect_player_totals_from_all_json(payloads) -> dict:
-    """Scan every captured JSON response for name -> total duration pairs."""
-    totals = {}
-
-    def walk(obj):
-        if isinstance(obj, dict):
-            lmap = {str(k).lower(): v for k, v in obj.items()}
-            name = None
-            for k in ("name", "player_name", "playername", "username", "player", "driver", "nick"):
-                v = lmap.get(k)
-                if isinstance(v, str) and v.strip():
-                    name = v.strip()
-                    break
-            if name:
-                for k, v in lmap.items():
-                    if v is None or isinstance(v, (dict, list, bool)):
-                        continue
-                    if any(tok in k for tok in ("total", "cumul", "overall", "alltime", "all_time", "lifetime", "server_dur", "serverdur")):
-                        if any(tok in k for tok in ("dur", "time", "sec", "hour", "hr", "min", "play")) or k == "total":
-                            cand = convert_numeric_duration_by_key(k, v)
-                            if parse_duration_seconds(cand) is not None:
-                                totals[name.lower()] = cand
-                                break
-            for v in obj.values():
-                walk(v)
-        elif isinstance(obj, list):
-            for item in obj:
-                walk(item)
-
-    for payload in payloads:
-        walk(payload)
-    return totals
-
-
 def extract_duration_leaders_map(full_text: str) -> dict:
-    """Fallback lookup of cumulative hours from the Duration Leaders table on the same page."""
+    """Server-specific cumulative hours from the Duration Leaders Top 20 table on server.html."""
     leaders = {}
     lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
     start = None
@@ -418,7 +380,6 @@ def extract_active_players_from_dom(page) -> tuple:
           href = link.getAttribute('href') || null;
         }
 
-        // Read cell-by-cell first so separate columns never merge awkwardly
         const cells = Array.from(rowEl.querySelectorAll(':scope > td, :scope > div, :scope > span'));
         const times = [];
         const cellTexts = cells.length >= 2 ? cells.map(c => (c.innerText || '').trim()) : [rawText];
@@ -454,7 +415,6 @@ def extract_active_players_from_dom(page) -> tuple:
         };
       };
 
-      // 1. Prefer real table rows (tbody tr) so we always capture ALL columns of each row
       let rowEls = Array.from(bestContainer.querySelectorAll('tbody tr'));
       if (rowEls.length === 0) {
         rowEls = Array.from(bestContainer.querySelectorAll('tr')).filter(r => !r.querySelector('th'));
@@ -472,7 +432,6 @@ def extract_active_players_from_dom(page) -> tuple:
         return { foundSection: true, empty: false, rows: parsedRows, sampleRaw: parsedRows[0].raw };
       }
 
-      // 2. Fallback: find player links and walk up to the full row container
       const links = Array.from(bestContainer.querySelectorAll('a[href*="player"]'));
       for (const a of links) {
         let rowEl = a.closest('tr, li');
@@ -495,7 +454,6 @@ def extract_active_players_from_dom(page) -> tuple:
         return { foundSection: true, empty: false, rows: parsedRows, sampleRaw: parsedRows[0].raw };
       }
 
-      // 3. Last-resort line scan inside the Active Players container
       const lines = containerText.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
       for (const line of lines) {
         if (ignoredNameRe.test(line)) continue;
@@ -529,91 +487,314 @@ def extract_active_players_from_dom(page) -> tuple:
     return [], ""
 
 
-def extract_total_duration_from_player_text(text: str, server_name: str = None):
-    """Extract Total Duration from a wfservers.com/player.html profile page."""
-    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+def looks_like_player_profile_json(obj) -> bool:
+    """Detect if a JSON response is the wfservers.com player profile endpoint (so we can reuse it)."""
+    if isinstance(obj, dict):
+        lkeys = {str(k).lower() for k in obj.keys()}
+        server_list_keys = {"servers", "server_history", "serverhistory", "server_stats", "serverstats", "history", "visits"}
+        if lkeys & server_list_keys:
+            return True
+        if ("total_duration" in lkeys or "totalduration" in lkeys or "servers_visited" in lkeys):
+            return True
+        for v in obj.values():
+            if isinstance(v, (dict, list)) and looks_like_player_profile_json(v):
+                return True
+    elif isinstance(obj, list) and obj and isinstance(obj[0], dict):
+        lkeys = {str(k).lower() for k in obj[0].keys()}
+        if any(k in lkeys for k in ("server_id", "serverid", "server_name", "servername")):
+            return True
+    return False
 
-    # Primary: "Total Duration" metric card near the top of player.html (e.g. "521:24:34")
-    for i, ln in enumerate(lines):
-        if re.search(r"total\s+duration", ln, re.I):
-            # Check same line first
-            m_same = re.search(r"(\d+:\d{2}:\d{2})", ln)
-            if m_same:
-                return m_same.group(1)
-            # Check next 3 lines
-            for nxt in lines[i + 1 : i + 4]:
-                m = re.search(r"(\d+:\d{2}:\d{2})", nxt)
-                if m:
-                    return m.group(1)
-                m_hrs = re.search(r"(\d+(?:\.\d+)?)\s*(?:hrs?|hours?)\b", nxt, re.I)
-                if m_hrs:
-                    return int(round(float(m_hrs.group(1)) * 3600))
 
-    # Secondary: look for the server name row on the player's profile page
-    if server_name:
-        snorm = normalize_name(server_name)
-        for i, ln in enumerate(lines):
-            if snorm and snorm in normalize_name(ln):
-                for nxt in lines[i : i + 4]:
-                    m = re.search(r"(\d+:\d{2}:\d{2})", nxt)
-                    if m:
-                        return m.group(1)
+def pick_duration_from_server_row_dict(lmap: dict):
+    """Extract duration from a single per-server row object inside player profile JSON."""
+    skip_tokens = ("last", "first", "seen", "active", "updated", "created", "date", "timestamp")
+    preferred_keys = (
+        "duration", "duration_seconds", "durationseconds", "total_duration", "totalduration",
+        "total_duration_seconds", "total_seconds", "totalseconds", "seconds", "total_time",
+        "totaltime", "playtime", "time_played", "timeplayed", "hours", "total_hours",
+        "duration_hours", "minutes", "duration_ms", "time",
+    )
+    for k in preferred_keys:
+        if k in lmap and lmap[k] is not None:
+            cand = convert_numeric_duration_by_key(k, lmap[k])
+            if parse_duration_seconds(cand) is not None:
+                return cand
+    for k, v in lmap.items():
+        if v is None or isinstance(v, (dict, list, bool)):
+            continue
+        if any(bad in k for bad in skip_tokens):
+            continue
+        if any(tok in k for tok in ("dur", "sec", "hour", "hr", "min", "play", "time")):
+            cand = convert_numeric_duration_by_key(k, v)
+            if parse_duration_seconds(cand) is not None:
+                return cand
     return None
 
 
-def extract_total_from_player_json(payloads):
-    """Extract total duration value from a player profile JSON response."""
+def extract_server_total_from_player_json(payloads, server_id: str, server_name: str, base_name: str):
+    """
+    Extract ONLY the player's duration on the target Get ReKt420 server from player profile JSON.
+    Returns (profile_loaded: bool, server_duration_or_None).
+    Never returns global all-server Total Duration.
+    """
+    exact_norm = normalize_name(server_name)
+    base_norm = normalize_name(base_name)
+    tier1_hits = []  # Exact server_id match
+    tier2_hits = []  # Exact server_name match
+    tier3_hits = []  # Prefix/base name (getrekt420) match
+    saw_server_list = False
+
+    def inspect_row(d: dict):
+        nonlocal saw_server_list
+        lmap = {str(k).lower(): v for k, v in d.items()}
+
+        row_sid = None
+        for k in ("server_id", "serverid", "sid"):
+            if k in lmap and lmap[k] is not None:
+                row_sid = str(lmap[k]).strip()
+                break
+
+        row_sname = None
+        for k in ("server_name", "servername", "server"):
+            v = lmap.get(k)
+            if isinstance(v, str) and v.strip():
+                row_sname = v.strip()
+                break
+
+        # If inside a servers list, "id" and "name" may also represent the server
+        if row_sname is None and isinstance(lmap.get("name"), str):
+            if row_sid is not None or any(k in lmap for k in ("last_active", "lastactive", "last_seen", "lastseen", "duration", "duration_seconds", "hours")):
+                row_sname = lmap["name"].strip()
+        if row_sid is None and lmap.get("id") is not None and row_sname is not None:
+            row_sid = str(lmap["id"]).strip()
+
+        if row_sid is None and row_sname is None:
+            return
+
+        # Make sure this dict is actually a server visit row (has a duration field)
+        dur = pick_duration_from_server_row_dict(lmap)
+        if dur is None:
+            return
+
+        saw_server_list = True
+        norm_row = normalize_name(row_sname) if row_sname else ""
+
+        if server_id and row_sid == str(server_id):
+            tier1_hits.append(dur)
+        elif exact_norm and norm_row == exact_norm:
+            tier2_hits.append(dur)
+        elif base_norm and base_norm in norm_row:
+            tier3_hits.append(dur)
+
     def walk(obj):
         if isinstance(obj, dict):
-            lmap = {str(k).lower(): v for k, v in obj.items()}
-            for k in (
-                "total_duration", "totalduration", "total_duration_seconds", "totaldurationseconds",
-                "total_seconds", "totalseconds", "total_time", "totaltime",
-                "duration_seconds", "durationseconds", "total_hours", "totalhours",
-            ):
-                if k in lmap and lmap[k] is not None:
-                    cand = convert_numeric_duration_by_key(k, lmap[k])
-                    if parse_duration_seconds(cand) is not None:
-                        return cand
+            inspect_row(obj)
             for v in obj.values():
-                res = walk(v)
-                if res is not None:
-                    return res
+                if isinstance(v, (dict, list)):
+                    walk(v)
         elif isinstance(obj, list):
             for item in obj:
-                res = walk(item)
-                if res is not None:
-                    return res
+                if isinstance(item, (dict, list)):
+                    walk(item)
+
+    for payload in payloads:
+        walk(payload)
+
+    if tier1_hits:
+        return True, tier1_hits[0]
+    if tier2_hits:
+        return True, tier2_hits[0]
+    if tier3_hits:
+        return True, tier3_hits[0]
+    return saw_server_list, None
+
+
+def extract_server_total_from_player_dom(page, server_id: str, server_name: str, base_name: str):
+    """
+    Read ONLY the target server's row from the Servers Visited table on wfservers.com/player.html.
+    Explicitly ignores the site header/footer ('Cultivated by: Get ReKt420*™') and global Total Duration.
+    """
+    js = r"""({ serverId, exactNorm, baseNorm }) => {
+      const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+      const stripDates = s => (s || '')
+        .replace(/\b\d{1,2}\/\d{1,2}\/\d{2,4}(?:,?\s+\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)?)?/gi, ' ')
+        .replace(/\b\d{4}-\d{2}-\d{2}(?:[T\s]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?/gi, ' ')
+        .replace(/\b\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM)\b/gi, ' ');
+
+      const extractDur = (txt) => {
+        const cleaned = stripDates(txt);
+        const m = cleaned.match(/\b(\d+:\d{2}:\d{2})\b/);
+        if (m) return m[1];
+        const m2 = cleaned.match(/\b(\d+(?:\.\d+)?\s*(?:hrs?|hours?))\b/i);
+        if (m2) return m2[1];
+        return null;
+      };
+
+      const isBadContainer = (el) => {
+        if (!el) return true;
+        if (el.closest('header, nav, footer')) return true;
+        const t = (el.innerText || '').toLowerCase();
+        if (t.includes('cultivated by') || t.includes('discord.gg') || t.includes('driver profile telemetry')) {
+          return true;
+        }
+        return false;
+      };
+
+      const links = Array.from(document.querySelectorAll('a[href*="server.html"]')).filter(a => !isBadContainer(a));
+      let hasAnyServerRows = links.length > 0;
+
+      const findRowForEl = (el) => {
+        let row = el.closest('tr, li');
+        if (row && !isBadContainer(row)) return row;
+        let cur = el.parentElement;
+        while (cur && !isBadContainer(cur)) {
+          if (cur.querySelectorAll('a[href*="server.html"]').length === 1) {
+            row = cur;
+            cur = cur.parentElement;
+          } else {
+            break;
+          }
+        }
+        return row || el;
+      };
+
+      // Tier 1: Exact server.html?id=<serverId> link
+      if (serverId) {
+        const idRe = new RegExp('[?&]id=' + serverId + '(?:&|$)');
+        for (const a of links) {
+          const href = a.getAttribute('href') || '';
+          if (idRe.test(href)) {
+            const row = findRowForEl(a);
+            const dur = extractDur(row.innerText || '');
+            if (dur) return { loaded: true, duration: dur, matchType: 'dom_id' };
+          }
+        }
+      }
+
+      // Tier 2 & 3: Exact server name or base name (getrekt420) among server links
+      let baseHit = null;
+      for (const a of links) {
+        const txtNorm = norm(a.innerText || '');
+        if (!txtNorm) continue;
+        const row = findRowForEl(a);
+        const dur = extractDur(row.innerText || '');
+        if (!dur) continue;
+        if (exactNorm && txtNorm === exactNorm) {
+          return { loaded: true, duration: dur, matchType: 'dom_exact_link' };
+        }
+        if (baseNorm && txtNorm.includes(baseNorm) && !baseHit) {
+          baseHit = dur;
+        }
+      }
+      if (baseHit) return { loaded: true, duration: baseHit, matchType: 'dom_base_link' };
+
+      // Fallback: check table rows (in case server names aren't anchor links)
+      const rows = Array.from(document.querySelectorAll('tbody tr, table tr')).filter(r => !r.querySelector('th') && !isBadContainer(r));
+      if (rows.length > 0) hasAnyServerRows = true;
+      for (const r of rows) {
+        const t = r.innerText || '';
+        const tn = norm(t);
+        const dur = extractDur(t);
+        if (!dur) continue;
+        if (exactNorm && tn.includes(exactNorm)) {
+          return { loaded: true, duration: dur, matchType: 'dom_exact_row' };
+        }
+        if (baseNorm && tn.includes(baseNorm) && !baseHit) {
+          baseHit = dur;
+        }
+      }
+      if (baseHit) return { loaded: true, duration: baseHit, matchType: 'dom_base_row' };
+
+      return { loaded: hasAnyServerRows, duration: null, matchType: 'none' };
+    }"""
+    try:
+        res = page.evaluate(
+            js,
+            {
+                "serverId": str(server_id) if server_id else "",
+                "exactNorm": normalize_name(server_name),
+                "baseNorm": normalize_name(base_name),
+            },
+        )
+        if res:
+            return bool(res.get("loaded")), res.get("duration")
+    except Exception:
+        pass
+    return False, None
+
+
+def extract_server_total_from_player_text(text: str, server_name: str, base_name: str):
+    """
+    Text fallback: extract ONLY the target server's duration from the Servers Visited section of player.html.
+    Explicitly ignores 'Cultivated by: Get ReKt420*™', global 'Total Duration', and AM/PM dates.
+    """
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    exact_norm = normalize_name(server_name)
+    base_norm = normalize_name(base_name)
+
+    # Start scanning only after the profile summary metrics (e.g., 'Servers Visited' or 'Last Active')
+    start_idx = 0
+    for i, ln in enumerate(lines):
+        low = ln.lower()
+        if "last active" in low or "servers visited" in low:
+            start_idx = i + 1
+
+    def find_duration_near(idx):
+        for offset in range(0, 3):
+            if idx + offset >= len(lines):
+                break
+            cand_line = lines[idx + offset]
+            if offset > 0 and ("cultivated by" in cand_line.lower() or "discord.gg" in cand_line.lower()):
+                break
+            cleaned = strip_date_timestamps(cand_line)
+            m = re.search(r"\b(\d+:\d{2}:\d{2})\b", cleaned)
+            if m:
+                return m.group(1)
+            m2 = re.search(r"\b(\d+(?:\.\d+)?)\s*(?:hrs?|hours?)\b", cleaned, re.I)
+            if m2:
+                return int(round(float(m2.group(1)) * 3600))
         return None
 
-    for p in payloads:
-        res = walk(p)
-        if res is not None:
-            return res
-    return None
+    base_fallback = None
+    for i in range(start_idx, len(lines)):
+        low = lines[i].lower()
+        if "cultivated by" in low or "discord.gg" in low or "total duration" in low:
+            continue
+        ln_norm = normalize_name(lines[i])
+        if exact_norm and exact_norm in ln_norm:
+            dur = find_duration_near(i)
+            if dur is not None:
+                return dur
+        elif base_norm and base_norm in ln_norm and base_fallback is None:
+            dur = find_duration_near(i)
+            if dur is not None:
+                base_fallback = dur
+
+    return base_fallback
 
 
-def enrich_missing_totals_via_player_profiles(context, players: list, server_name: str) -> None:
-    """If server.html did not expose Total Duration, pull each active player's Total Duration from wfservers.com/player.html."""
+def enrich_missing_totals_via_player_profiles(
+    context, players: list, server_id: str, server_name: str, base_name: str
+) -> None:
+    """Pull each active player's Get ReKt420 server-specific Total Duration from wfservers.com/player.html."""
     missing = [p for p in players if parse_duration_seconds(p.get("total")) is None]
     if not missing:
         return
 
-    print(f"Fetching Total Duration for {len(missing)} active players from player profiles...")
+    print(f"Fetching {server_name} server-only totals for {len(missing)} active players...")
 
     def build_profile_url(p):
         if p.get("href"):
             return urljoin(TARGET_URL, p["href"])
         return f"https://www.wfservers.com/player.html?name={quote(p['name'], safe='')}"
 
-    # Block heavy assets so player profile fetches finish in ~0.5-1s each
     def block_heavy(route):
         if route.request.resource_type in ("image", "media", "font", "stylesheet"):
             route.abort()
         else:
             route.continue_()
 
-    # Probe the first missing player and watch for a reusable JSON API endpoint
     first = missing[0]
     first_url = build_profile_url(first)
     discovered_api_template = None
@@ -631,15 +812,14 @@ def enrich_missing_totals_via_player_profiles(context, players: list, server_nam
             if "json" not in ctype.lower():
                 return
             data = response.json()
-            tot = extract_total_from_player_json([data])
-            if tot is not None:
+            if looks_like_player_profile_json(data):
                 first_json_payloads.append(data)
                 u = response.url
                 if first_name_enc in u:
                     discovered_api_template = u.replace(first_name_enc, "{NAME}")
                 elif first_name_low in unquote(u).lower():
-                    idx = unquote(u).lower().find(first_name_low)
                     raw_dec = unquote(u)
+                    idx = raw_dec.lower().find(first_name_low)
                     orig_slice = raw_dec[idx : idx + len(first["name"])]
                     if quote(orig_slice, safe="") in u:
                         discovered_api_template = u.replace(quote(orig_slice, safe=""), "{NAME}")
@@ -653,17 +833,30 @@ def enrich_missing_totals_via_player_profiles(context, players: list, server_nam
         probe_page.goto(first_url, wait_until="networkidle", timeout=20000)
         try:
             probe_page.wait_for_function(
-                "() => /\\d+:\\d{2}:\\d{2}/.test(document.body.innerText)",
-                timeout=6000,
+                "() => document.querySelectorAll('a[href*=\"server.html\"]').length > 0 || /servers\\s+visited/i.test(document.body.innerText)",
+                timeout=7000,
             )
         except Exception:
             pass
-        probe_page.wait_for_timeout(500)
-        tot = extract_total_from_player_json(first_json_payloads)
+        probe_page.wait_for_timeout(600)
+
+        loaded_json, tot = extract_server_total_from_player_json(
+            first_json_payloads, server_id, server_name, base_name
+        )
+        loaded_dom = False
         if tot is None:
-            tot = extract_total_duration_from_player_text(probe_page.locator("body").inner_text(), server_name)
+            loaded_dom, tot = extract_server_total_from_player_dom(
+                probe_page, server_id, server_name, base_name
+            )
+        if tot is None:
+            tot = extract_server_total_from_player_text(
+                probe_page.locator("body").inner_text(), server_name, base_name
+            )
         if tot is not None:
             first["total"] = tot
+        elif loaded_json or loaded_dom:
+            # Profile loaded cleanly, player just has no prior banked time on this server yet
+            first["total"] = 0
     except Exception as e:
         print(f"Profile probe error for {first['name']}: {e}")
     finally:
@@ -673,21 +866,25 @@ def enrich_missing_totals_via_player_profiles(context, players: list, server_nam
     if not remaining:
         return
 
-    # Fast path: reuse discovered JSON API endpoint directly for all remaining players (~1-2s total)
+    # Fast path: reuse discovered player profile JSON API directly (~1-2s for all 24 players)
     if discovered_api_template:
-        print("Using fast player API endpoint for remaining players...")
+        print("Using fast player API endpoint for server-specific totals...")
         for p in remaining:
             try:
                 api_url = discovered_api_template.replace("{NAME}", quote(p["name"], safe=""))
                 resp = requests.get(api_url, timeout=8)
                 if resp.status_code == 200:
-                    tot = extract_total_from_player_json([resp.json()])
+                    loaded, tot = extract_server_total_from_player_json(
+                        [resp.json()], server_id, server_name, base_name
+                    )
                     if tot is not None:
                         p["total"] = tot
+                    elif loaded:
+                        p["total"] = 0
             except Exception:
                 pass
 
-    # Fallback path: fetch any still-missing player pages with a lightweight Playwright page
+    # Fallback path: lightweight Playwright lookup for any remaining players
     still_missing = [p for p in remaining if parse_duration_seconds(p.get("total")) is None]
     if still_missing:
         page = context.new_page()
@@ -708,17 +905,30 @@ def enrich_missing_totals_via_player_profiles(context, players: list, server_nam
                     page.goto(build_profile_url(p), wait_until="domcontentloaded", timeout=15000)
                     try:
                         page.wait_for_function(
-                            "() => /\\d+:\\d{2}:\\d{2}/.test(document.body.innerText)",
-                            timeout=5000,
+                            "() => document.querySelectorAll('a[href*=\"server.html\"]').length > 0 || /last\\s+active/i.test(document.body.innerText)",
+                            timeout=6000,
                         )
                     except Exception:
                         pass
+                    page.wait_for_timeout(300)
                     page.remove_listener("response", capture_p)
-                    tot = extract_total_from_player_json(p_json)
+
+                    loaded_j, tot = extract_server_total_from_player_json(
+                        p_json, server_id, server_name, base_name
+                    )
+                    loaded_d = False
                     if tot is None:
-                        tot = extract_total_duration_from_player_text(page.locator("body").inner_text(), server_name)
+                        loaded_d, tot = extract_server_total_from_player_dom(
+                            page, server_id, server_name, base_name
+                        )
+                    if tot is None:
+                        tot = extract_server_total_from_player_text(
+                            page.locator("body").inner_text(), server_name, base_name
+                        )
                     if tot is not None:
                         p["total"] = tot
+                    elif loaded_j or loaded_d:
+                        p["total"] = 0
                 except Exception:
                     pass
         finally:
@@ -828,6 +1038,7 @@ def fetch_server_status() -> dict:
         page = context.new_page()
 
         server_url = find_server_page_url(page, target_norm)
+        server_id = extract_server_id(server_url)
 
         def handle_response(response):
             try:
@@ -847,7 +1058,6 @@ def fetch_server_status() -> dict:
             )
         except Exception:
             pass
-        # Give async total-duration cells time to finish hydrating on server.html
         page.wait_for_timeout(4000)
 
         dom_players, sample_raw = extract_active_players_from_dom(page)
@@ -855,13 +1065,11 @@ def fetch_server_status() -> dict:
 
         parsed = extract_detail_fields_from_text(full_text)
         json_players = extract_active_players_from_json(captured_json)
-        json_totals_map = collect_player_totals_from_all_json(captured_json)
         leaders_map = extract_duration_leaders_map(full_text)
 
         if sample_raw:
             print(f"Row 1 sample: {sample_raw}")
 
-        # Merge DOM + JSON + Duration Leaders
         if dom_players:
             json_by_name = {p["name"].lower(): p for p in json_players}
             players = []
@@ -869,11 +1077,7 @@ def fetch_server_status() -> dict:
                 low = p["name"].lower()
                 jp = json_by_name.get(low, {})
                 session = p["session"] if p["session"] is not None else jp.get("session")
-                total = p["total"]
-                if total is None:
-                    total = jp.get("total")
-                if total is None:
-                    total = json_totals_map.get(low)
+                total = p["total"] if p["total"] is not None else jp.get("total")
                 players.append({
                     "name": p["name"],
                     "href": p.get("href"),
@@ -884,13 +1088,11 @@ def fetch_server_status() -> dict:
         else:
             players = []
             for p in json_players:
-                low = p["name"].lower()
-                total = p["total"] if p["total"] is not None else json_totals_map.get(low)
                 players.append({
                     "name": p["name"],
                     "href": p.get("href"),
                     "session": p["session"],
-                    "total": total,
+                    "total": p["total"],
                     "session_secs": parse_duration_seconds(p["session"]),
                 })
 
@@ -902,12 +1104,13 @@ def fetch_server_status() -> dict:
 
         players = players[:MAX_PLAYERS_SHOWN]
 
-        # If server.html didn't include Total Duration for active players, look them up on wfservers.com/player.html
         display_server_name = parsed["name"] or SERVER_NAME
         if players and any(parse_duration_seconds(pl.get("total")) is None for pl in players):
-            enrich_missing_totals_via_player_profiles(context, players, display_server_name)
+            enrich_missing_totals_via_player_profiles(
+                context, players, server_id, display_server_name, SERVER_NAME
+            )
 
-        # Last fallback: Duration Leaders Top 20 on server.html
+        # Secondary fallback: Duration Leaders Top 20 on this exact server page
         for pl in players:
             if parse_duration_seconds(pl.get("total")) is None:
                 fallback_tot = leaders_map.get(pl["name"].lower())
@@ -937,13 +1140,13 @@ def fetch_server_status() -> dict:
 def build_ansi_roster_table(players: list) -> str:
     ESC = "\u001b"
     RESET = f"{ESC}[0m"
-    HEADER = f"{ESC}[1;37m"      # Crisp bold white header
-    YELLOW = f"{ESC}[1;33m"      # 1st place: Yellow
-    GRAY_2ND = f"{ESC}[1;37;42m" # 2nd place: Slate Gray badge
-    ORANGE_3RD = f"{ESC}[1;37;41m"  # 3rd place: Orange badge (#cb4b16 in Discord ANSI)
-    LEGIBLE_RANK = f"{ESC}[0;37m"   # 4th-24th: Clean readable light gray
-    ROW_TEXT = f"{ESC}[0;37m"       # Clean readable light gray text
-    DIVIDER = f"{ESC}[0;37m"        # Subtle, non-wrapping divider
+    HEADER = f"{ESC}[1;37m"                         # Bold white header
+    YELLOW_1ST = f"{ESC}[1;33m"                     # 1st place: Yellow
+    GRAY_2ND = f"{ESC}[1;30;47m{ESC}[48;2;154;160;170m"  # 2nd place: True silver-gray badge (47 = Light Gray fallback)
+    ORANGE_3RD = f"{ESC}[1;37;41m{ESC}[48;2;217;119;6m"  # 3rd place: Orange badge
+    LEGIBLE_RANK = f"{ESC}[0;37m"                   # 4th-24th: Clean readable light gray
+    ROW_TEXT = f"{ESC}[0;37m"                       # Clean readable light gray text
+    DIVIDER = f"{ESC}[0;37m"
 
     # Total visible width = 4 + 1 + 16 + 1 + 8 + 1 + 9 = 40 chars (never wraps in Discord embeds)
     header = f"{HEADER}{'Rank':<4} {'Player':<16} {'Session':>8} {'Total':>9}{RESET}"
@@ -957,7 +1160,7 @@ def build_ansi_roster_table(players: list) -> str:
             raw_badge = f"[{rank}]"
             left_pad = " " * (4 - len(raw_badge))
             if rank == 1:
-                badge = f"{left_pad}{YELLOW}{raw_badge}{RESET}"
+                badge = f"{left_pad}{YELLOW_1ST}{raw_badge}{RESET}"
             elif rank == 2:
                 badge = f"{left_pad}{GRAY_2ND}{raw_badge}{RESET}"
             elif rank == 3:
@@ -965,7 +1168,6 @@ def build_ansi_roster_table(players: list) -> str:
             else:
                 badge = f"{left_pad}{LEGIBLE_RANK}{raw_badge}{RESET}"
 
-            # Strip backticks so player tags cannot break the Discord code block
             raw_name = p["name"].replace("`", "'")
             if len(raw_name) > 16:
                 display_name = raw_name[:15] + "…"
@@ -1051,7 +1253,7 @@ def main():
             with_totals = sum(1 for pl in info["players"] if parse_duration_seconds(pl.get("total")) is not None)
             print(
                 f"Updated card: {info['current']}/{info['maximum']} players "
-                f"({len(info['players'])} listed, {with_totals} with Total Duration)"
+                f"({len(info['players'])} listed, {with_totals} with Get ReKt420 Total)"
             )
 
     if not message_id:
