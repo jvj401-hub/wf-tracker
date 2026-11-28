@@ -1,32 +1,38 @@
+import asyncio
+import json
 import os
 import re
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from urllib.parse import quote, unquote, urljoin
 import requests
-from playwright.sync_api import sync_playwright
+from playwright.async_api import async_playwright
 
 SERVER_NAME = "Get ReKt420"
 TARGET_URL = "https://wfservers.com"
-# Optional: paste a direct wfservers.com/server.html?id=... link here to lock onto one exact server.
-# Leave blank to auto-find Get ReKt420 on wfservers.com (falls back to Midwest server #309494).
-SERVER_PAGE_URL = ""
-FALLBACK_SERVER_URL = "https://www.wfservers.com/server.html?id=309494"
+# Locked directly to Get ReKt 420*™ Midwest so we skip loading the homepage every run.
+# Change this URL if you want to track a different wfservers.com server page.
+SERVER_PAGE_URL = "https://www.wfservers.com/server.html?id=309494"
 MAX_PLAYERS_SHOWN = 24
 
-THUMBNAIL_CANDIDATES = [
-    "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/228380/header.jpg",
-    "https://steamcdn-a.akamaihd.net/steam/apps/228380/header.jpg",
-]
+# Speed & reliability tuning
+CACHE_TTL_SECONDS = 1800          # Re-use cached Get ReKt420 totals for 30 mins (ticks up with live session)
+CACHE_MAX_AGE_SECONDS = 86400 * 30  # Keep seen players cached for 30 days
+PROFILE_CONCURRENCY = 5           # Fetch up to 5 player profiles at once in Playwright
+ENRICH_TIME_BUDGET_SECONDS = 45   # Never let profile lookups delay or time out the Discord update
+
+THUMBNAIL_URL = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/228380/header.jpg"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-def resolve_msg_id_path() -> str:
+def resolve_state_path(filename: str) -> str:
     candidates = [
-        os.path.join(BASE_DIR, "message_id.txt"),
-        os.path.join(BASE_DIR, "UPLOAD_INSIDE_TO_GITHUB", "message_id.txt"),
-        os.path.join(os.path.dirname(BASE_DIR), "message_id.txt"),
+        os.path.join(BASE_DIR, filename),
+        os.path.join(BASE_DIR, "UPLOAD_INSIDE_TO_GITHUB", filename),
+        os.path.join(os.path.dirname(BASE_DIR), filename),
     ]
     for path in candidates:
         if os.path.exists(path):
@@ -45,7 +51,7 @@ def is_valid_webhook(url: str) -> bool:
 
 
 def load_message_id():
-    path = resolve_msg_id_path()
+    path = resolve_state_path("message_id.txt")
     if os.path.exists(path):
         with open(path, "r", encoding="utf-8") as f:
             val = f.read().strip()
@@ -54,10 +60,74 @@ def load_message_id():
 
 
 def save_message_id(msg_id: str) -> None:
-    path = resolve_msg_id_path()
+    path = resolve_state_path("message_id.txt")
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         f.write(str(msg_id).strip() + "\n")
+
+
+def load_totals_cache(server_id: str) -> dict:
+    path = resolve_state_path("player_totals_cache.json")
+    if not os.path.exists(path):
+        return {"server_id": str(server_id or ""), "players": {}}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and str(data.get("server_id", "")) == str(server_id or ""):
+            if isinstance(data.get("players"), dict):
+                return data
+    except Exception:
+        pass
+    return {"server_id": str(server_id or ""), "players": {}}
+
+
+def save_totals_cache(cache: dict) -> None:
+    path = resolve_state_path("player_totals_cache.json")
+    now = int(time.time())
+    players = cache.get("players", {})
+    # Prune stale entries older than 30 days so the cache stays compact
+    pruned = {
+        k: v
+        for k, v in players.items()
+        if isinstance(v, dict) and (now - int(v.get("fetched_at", 0))) <= CACHE_MAX_AGE_SECONDS
+    }
+    out = {"server_id": str(cache.get("server_id", "")), "players": pruned}
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(out, f, separators=(",", ":"), sort_keys=True)
+        f.write("\n")
+
+
+def load_api_cache(server_id: str) -> dict:
+    path = resolve_state_path("wf_api_cache.json")
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and str(data.get("server_id", "")) == str(server_id or ""):
+            return data
+    except Exception:
+        pass
+    return {}
+
+
+def save_api_cache(server_id: str, player_api_template: str = None) -> None:
+    if not player_api_template:
+        return
+    # Safety check: never persist query tokens/keys if any appear in a URL
+    low = player_api_template.lower()
+    if any(tok in low for tok in ("apikey=", "api_key=", "token=", "secret=", "auth=")):
+        return
+    path = resolve_state_path("wf_api_cache.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = {
+        "server_id": str(server_id or ""),
+        "player_api_template": player_api_template,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.write("\n")
 
 
 def normalize_name(text: str) -> str:
@@ -75,17 +145,6 @@ def make_progress_bar(current: int, maximum: int, length: int = 16) -> str:
     pct = min(max(current / maximum, 0.0), 1.0)
     filled = round(pct * length)
     return f"`[{'■' * filled}{'□' * (length - filled)}]` {int(pct * 100)}%"
-
-
-def pick_working_thumbnail() -> str:
-    for url in THUMBNAIL_CANDIDATES:
-        try:
-            r = requests.head(url, timeout=6, allow_redirects=True)
-            if r.status_code == 200:
-                return url
-        except Exception:
-            pass
-    return THUMBNAIL_CANDIDATES[0]
 
 
 def strip_date_timestamps(text: str) -> str:
@@ -243,7 +302,6 @@ def extract_players_from_list(items) -> list:
                     session_val = convert_numeric_duration_by_key(key, pmap[key])
                     break
 
-            # Only grab explicitly server-scoped totals from server.html JSON (never global totals)
             total_val = None
             server_total_keys = (
                 "server_duration", "serverduration", "server_duration_seconds", "server_time",
@@ -336,7 +394,7 @@ def extract_duration_leaders_map(full_text: str) -> dict:
     return leaders
 
 
-def extract_active_players_from_dom(page) -> tuple:
+async def extract_active_players_from_dom(page) -> tuple:
     js = r"""() => {
       const headings = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,div,span,p,header'));
       let bestContainer = null;
@@ -477,7 +535,7 @@ def extract_active_players_from_dom(page) -> tuple:
       };
     }"""
     try:
-        res = page.evaluate(js)
+        res = await page.evaluate(js)
         if res and res.get("foundSection"):
             if res.get("empty"):
                 return [], "empty"
@@ -488,13 +546,12 @@ def extract_active_players_from_dom(page) -> tuple:
 
 
 def looks_like_player_profile_json(obj) -> bool:
-    """Detect if a JSON response is the wfservers.com player profile endpoint (so we can reuse it)."""
     if isinstance(obj, dict):
         lkeys = {str(k).lower() for k in obj.keys()}
         server_list_keys = {"servers", "server_history", "serverhistory", "server_stats", "serverstats", "history", "visits"}
         if lkeys & server_list_keys:
             return True
-        if ("total_duration" in lkeys or "totalduration" in lkeys or "servers_visited" in lkeys):
+        if "total_duration" in lkeys or "totalduration" in lkeys or "servers_visited" in lkeys:
             return True
         for v in obj.values():
             if isinstance(v, (dict, list)) and looks_like_player_profile_json(v):
@@ -507,7 +564,6 @@ def looks_like_player_profile_json(obj) -> bool:
 
 
 def pick_duration_from_server_row_dict(lmap: dict):
-    """Extract duration from a single per-server row object inside player profile JSON."""
     skip_tokens = ("last", "first", "seen", "active", "updated", "created", "date", "timestamp")
     preferred_keys = (
         "duration", "duration_seconds", "durationseconds", "total_duration", "totalduration",
@@ -533,16 +589,12 @@ def pick_duration_from_server_row_dict(lmap: dict):
 
 
 def extract_server_total_from_player_json(payloads, server_id: str, server_name: str, base_name: str):
-    """
-    Extract ONLY the player's duration on the target Get ReKt420 server from player profile JSON.
-    Returns (profile_loaded: bool, server_duration_or_None).
-    Never returns global all-server Total Duration.
-    """
+    """Extract ONLY the player's duration on the target Get ReKt420 server from player profile JSON."""
     exact_norm = normalize_name(server_name)
     base_norm = normalize_name(base_name)
-    tier1_hits = []  # Exact server_id match
-    tier2_hits = []  # Exact server_name match
-    tier3_hits = []  # Prefix/base name (getrekt420) match
+    tier1_hits = []
+    tier2_hits = []
+    tier3_hits = []
     saw_server_list = False
 
     def inspect_row(d: dict):
@@ -562,9 +614,10 @@ def extract_server_total_from_player_json(payloads, server_id: str, server_name:
                 row_sname = v.strip()
                 break
 
-        # If inside a servers list, "id" and "name" may also represent the server
         if row_sname is None and isinstance(lmap.get("name"), str):
-            if row_sid is not None or any(k in lmap for k in ("last_active", "lastactive", "last_seen", "lastseen", "duration", "duration_seconds", "hours")):
+            if row_sid is not None or any(
+                k in lmap for k in ("last_active", "lastactive", "last_seen", "lastseen", "duration", "duration_seconds", "hours")
+            ):
                 row_sname = lmap["name"].strip()
         if row_sid is None and lmap.get("id") is not None and row_sname is not None:
             row_sid = str(lmap["id"]).strip()
@@ -572,7 +625,6 @@ def extract_server_total_from_player_json(payloads, server_id: str, server_name:
         if row_sid is None and row_sname is None:
             return
 
-        # Make sure this dict is actually a server visit row (has a duration field)
         dur = pick_duration_from_server_row_dict(lmap)
         if dur is None:
             return
@@ -610,11 +662,7 @@ def extract_server_total_from_player_json(payloads, server_id: str, server_name:
     return saw_server_list, None
 
 
-def extract_server_total_from_player_dom(page, server_id: str, server_name: str, base_name: str):
-    """
-    Read ONLY the target server's row from the Servers Visited table on wfservers.com/player.html.
-    Explicitly ignores the site header/footer ('Cultivated by: Get ReKt420*™') and global Total Duration.
-    """
+async def extract_server_total_from_player_dom(page, server_id: str, server_name: str, base_name: str):
     js = r"""({ serverId, exactNorm, baseNorm }) => {
       const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
       const stripDates = s => (s || '')
@@ -659,7 +707,6 @@ def extract_server_total_from_player_dom(page, server_id: str, server_name: str,
         return row || el;
       };
 
-      // Tier 1: Exact server.html?id=<serverId> link
       if (serverId) {
         const idRe = new RegExp('[?&]id=' + serverId + '(?:&|$)');
         for (const a of links) {
@@ -667,12 +714,11 @@ def extract_server_total_from_player_dom(page, server_id: str, server_name: str,
           if (idRe.test(href)) {
             const row = findRowForEl(a);
             const dur = extractDur(row.innerText || '');
-            if (dur) return { loaded: true, duration: dur, matchType: 'dom_id' };
+            if (dur) return { loaded: true, duration: dur };
           }
         }
       }
 
-      // Tier 2 & 3: Exact server name or base name (getrekt420) among server links
       let baseHit = null;
       for (const a of links) {
         const txtNorm = norm(a.innerText || '');
@@ -681,15 +727,14 @@ def extract_server_total_from_player_dom(page, server_id: str, server_name: str,
         const dur = extractDur(row.innerText || '');
         if (!dur) continue;
         if (exactNorm && txtNorm === exactNorm) {
-          return { loaded: true, duration: dur, matchType: 'dom_exact_link' };
+          return { loaded: true, duration: dur };
         }
         if (baseNorm && txtNorm.includes(baseNorm) && !baseHit) {
           baseHit = dur;
         }
       }
-      if (baseHit) return { loaded: true, duration: baseHit, matchType: 'dom_base_link' };
+      if (baseHit) return { loaded: true, duration: baseHit };
 
-      // Fallback: check table rows (in case server names aren't anchor links)
       const rows = Array.from(document.querySelectorAll('tbody tr, table tr')).filter(r => !r.querySelector('th') && !isBadContainer(r));
       if (rows.length > 0) hasAnyServerRows = true;
       for (const r of rows) {
@@ -698,18 +743,18 @@ def extract_server_total_from_player_dom(page, server_id: str, server_name: str,
         const dur = extractDur(t);
         if (!dur) continue;
         if (exactNorm && tn.includes(exactNorm)) {
-          return { loaded: true, duration: dur, matchType: 'dom_exact_row' };
+          return { loaded: true, duration: dur };
         }
         if (baseNorm && tn.includes(baseNorm) && !baseHit) {
           baseHit = dur;
         }
       }
-      if (baseHit) return { loaded: true, duration: baseHit, matchType: 'dom_base_row' };
+      if (baseHit) return { loaded: true, duration: baseHit };
 
-      return { loaded: hasAnyServerRows, duration: null, matchType: 'none' };
+      return { loaded: hasAnyServerRows, duration: null };
     }"""
     try:
-        res = page.evaluate(
+        res = await page.evaluate(
             js,
             {
                 "serverId": str(server_id) if server_id else "",
@@ -725,15 +770,10 @@ def extract_server_total_from_player_dom(page, server_id: str, server_name: str,
 
 
 def extract_server_total_from_player_text(text: str, server_name: str, base_name: str):
-    """
-    Text fallback: extract ONLY the target server's duration from the Servers Visited section of player.html.
-    Explicitly ignores 'Cultivated by: Get ReKt420*™', global 'Total Duration', and AM/PM dates.
-    """
     lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
     exact_norm = normalize_name(server_name)
     base_norm = normalize_name(base_name)
 
-    # Start scanning only after the profile summary metrics (e.g., 'Servers Visited' or 'Last Active')
     start_idx = 0
     for i, ln in enumerate(lines):
         low = ln.lower()
@@ -774,165 +814,268 @@ def extract_server_total_from_player_text(text: str, server_name: str, base_name
     return base_fallback
 
 
-def enrich_missing_totals_via_player_profiles(
-    context, players: list, server_id: str, server_name: str, base_name: str
-) -> None:
-    """Pull each active player's Get ReKt420 server-specific Total Duration from wfservers.com/player.html."""
-    missing = [p for p in players if parse_duration_seconds(p.get("total")) is None]
-    if not missing:
-        return
+def apply_cached_totals(players: list, cache: dict, now_ts: int) -> tuple:
+    """
+    Fill fresh cached Get ReKt420 totals immediately (and advance them with live session delta).
+    Returns (players_needing_fetch, stale_fallbacks_by_lower_name).
+    """
+    cached_map = cache.get("players", {})
+    to_fetch = []
+    stale_fallbacks = {}
 
-    print(f"Fetching {server_name} server-only totals for {len(missing)} active players...")
+    for p in players:
+        if parse_duration_seconds(p.get("total")) is not None:
+            continue
+        low = p["name"].lower()
+        entry = cached_map.get(low)
+        cur_sess = p.get("session_secs")
+
+        if isinstance(entry, dict) and entry.get("total_secs") is not None:
+            base_total = int(entry["total_secs"])
+            fetched_at = int(entry.get("fetched_at", 0))
+            prev_sess = entry.get("session_secs_at_fetch")
+
+            if cur_sess is not None and prev_sess is not None and cur_sess >= int(prev_sess):
+                estimated = base_total + (cur_sess - int(prev_sess))
+            else:
+                estimated = base_total
+
+            if (now_ts - fetched_at) < CACHE_TTL_SECONDS:
+                p["total"] = estimated
+            else:
+                stale_fallbacks[low] = estimated
+                to_fetch.append((1, fetched_at, p))  # priority 1 = stale refresh
+        else:
+            to_fetch.append((0, 0, p))  # priority 0 = brand-new player (highest priority)
+
+    # Fetch brand-new players first, then oldest stale entries
+    to_fetch.sort(key=lambda item: (item[0], item[1]))
+    return [item[2] for item in to_fetch], stale_fallbacks
+
+
+def fetch_via_http_api_batch(api_template: str, players: list, server_id: str, server_name: str, base_name: str) -> dict:
+    """Concurrently fetch server-only totals via discovered JSON API using 8 threads."""
+    results = {}
+
+    def fetch_one(p):
+        try:
+            api_url = api_template.replace("{NAME}", quote(p["name"], safe=""))
+            resp = requests.get(api_url, timeout=6)
+            if resp.status_code == 200:
+                loaded, tot = extract_server_total_from_player_json(
+                    [resp.json()], server_id, server_name, base_name
+                )
+                if tot is not None:
+                    return p["name"].lower(), parse_duration_seconds(tot)
+                if loaded:
+                    return p["name"].lower(), 0
+        except Exception:
+            pass
+        return p["name"].lower(), None
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for low, secs in pool.map(fetch_one, players):
+            if secs is not None:
+                results[low] = secs
+    return results
+
+
+async def block_heavy_assets(route):
+    if route.request.resource_type in ("image", "media", "font", "stylesheet"):
+        await route.abort()
+    else:
+        await route.continue_()
+
+
+async def enrich_missing_totals_fast(
+    context,
+    players: list,
+    cache: dict,
+    api_cache: dict,
+    server_id: str,
+    server_name: str,
+    base_name: str,
+) -> bool:
+    """
+    Fast Get ReKt420 server-only Total Duration loader:
+      1. Uses fresh player_totals_cache.json entries immediately (0ms).
+      2. Tries cached JSON API template in parallel (8 threads, ~1s for all 24 players).
+      3. Falls back to 5 concurrent lightweight Playwright tabs with a hard 45s time budget.
+    Returns True if cache was updated.
+    """
+    now_ts = int(time.time())
+    to_fetch, stale_fallbacks = apply_cached_totals(players, cache, now_ts)
+    if not to_fetch:
+        print(f"All {len(players)} player totals served instantly from cache!")
+        return False
+
+    t_start = time.monotonic()
+    cache_dirty = False
+    cached_map = cache.setdefault("players", {})
+
+    def record_total(p, secs: int):
+        nonlocal cache_dirty
+        p["total"] = secs
+        cached_map[p["name"].lower()] = {
+            "total_secs": int(secs),
+            "session_secs_at_fetch": p.get("session_secs"),
+            "fetched_at": int(time.time()),
+        }
+        cache_dirty = True
 
     def build_profile_url(p):
         if p.get("href"):
             return urljoin(TARGET_URL, p["href"])
         return f"https://www.wfservers.com/player.html?name={quote(p['name'], safe='')}"
 
-    def block_heavy(route):
-        if route.request.resource_type in ("image", "media", "font", "stylesheet"):
-            route.abort()
-        else:
-            route.continue_()
+    # Fast Path A: Try already-known JSON API template first (no Playwright tabs needed!)
+    discovered_api = api_cache.get("player_api_template")
+    if discovered_api:
+        hits = fetch_via_http_api_batch(discovered_api, to_fetch, server_id, server_name, base_name)
+        for p in to_fetch:
+            secs = hits.get(p["name"].lower())
+            if secs is not None:
+                record_total(p, secs)
+        to_fetch = [p for p in to_fetch if parse_duration_seconds(p.get("total")) is None]
+        if not to_fetch:
+            print(f"Fetched {len(hits)} player totals via fast JSON API in {time.monotonic() - t_start:.1f}s!")
+            return cache_dirty
 
-    first = missing[0]
-    first_url = build_profile_url(first)
-    discovered_api_template = None
-    first_json_payloads = []
-    probe_page = context.new_page()
-    probe_page.route("**/*", block_heavy)
+    # Fast Path B: Probe 1 player via Playwright to discover the JSON API template
+    if to_fetch and not discovered_api and (time.monotonic() - t_start) < ENRICH_TIME_BUDGET_SECONDS:
+        first = to_fetch[0]
+        probe_page = await context.new_page()
+        await probe_page.route("**/*", block_heavy_assets)
+        first_json = []
+        first_enc = quote(first["name"], safe="")
+        first_low = first["name"].lower()
 
-    first_name_enc = quote(first["name"], safe="")
-    first_name_low = first["name"].lower()
-
-    def on_probe_response(response):
-        nonlocal discovered_api_template
-        try:
-            ctype = response.headers.get("content-type", "")
-            if "json" not in ctype.lower():
-                return
-            data = response.json()
-            if looks_like_player_profile_json(data):
-                first_json_payloads.append(data)
-                u = response.url
-                if first_name_enc in u:
-                    discovered_api_template = u.replace(first_name_enc, "{NAME}")
-                elif first_name_low in unquote(u).lower():
-                    raw_dec = unquote(u)
-                    idx = raw_dec.lower().find(first_name_low)
-                    orig_slice = raw_dec[idx : idx + len(first["name"])]
-                    if quote(orig_slice, safe="") in u:
-                        discovered_api_template = u.replace(quote(orig_slice, safe=""), "{NAME}")
-                    elif orig_slice in u:
-                        discovered_api_template = u.replace(orig_slice, "{NAME}")
-        except Exception:
-            pass
-
-    probe_page.on("response", on_probe_response)
-    try:
-        probe_page.goto(first_url, wait_until="networkidle", timeout=20000)
-        try:
-            probe_page.wait_for_function(
-                "() => document.querySelectorAll('a[href*=\"server.html\"]').length > 0 || /servers\\s+visited/i.test(document.body.innerText)",
-                timeout=7000,
-            )
-        except Exception:
-            pass
-        probe_page.wait_for_timeout(600)
-
-        loaded_json, tot = extract_server_total_from_player_json(
-            first_json_payloads, server_id, server_name, base_name
-        )
-        loaded_dom = False
-        if tot is None:
-            loaded_dom, tot = extract_server_total_from_player_dom(
-                probe_page, server_id, server_name, base_name
-            )
-        if tot is None:
-            tot = extract_server_total_from_player_text(
-                probe_page.locator("body").inner_text(), server_name, base_name
-            )
-        if tot is not None:
-            first["total"] = tot
-        elif loaded_json or loaded_dom:
-            # Profile loaded cleanly, player just has no prior banked time on this server yet
-            first["total"] = 0
-    except Exception as e:
-        print(f"Profile probe error for {first['name']}: {e}")
-    finally:
-        probe_page.close()
-
-    remaining = [p for p in missing[1:] if parse_duration_seconds(p.get("total")) is None]
-    if not remaining:
-        return
-
-    # Fast path: reuse discovered player profile JSON API directly (~1-2s for all 24 players)
-    if discovered_api_template:
-        print("Using fast player API endpoint for server-specific totals...")
-        for p in remaining:
+        async def handle_probe_resp(response):
+            nonlocal discovered_api
             try:
-                api_url = discovered_api_template.replace("{NAME}", quote(p["name"], safe=""))
-                resp = requests.get(api_url, timeout=8)
-                if resp.status_code == 200:
-                    loaded, tot = extract_server_total_from_player_json(
-                        [resp.json()], server_id, server_name, base_name
-                    )
-                    if tot is not None:
-                        p["total"] = tot
-                    elif loaded:
-                        p["total"] = 0
+                ctype = response.headers.get("content-type", "")
+                if "json" not in ctype.lower():
+                    return
+                data = await response.json()
+                if looks_like_player_profile_json(data):
+                    first_json.append(data)
+                    u = response.url
+                    if first_enc in u:
+                        discovered_api = u.replace(first_enc, "{NAME}")
+                    elif first_low in unquote(u).lower():
+                        raw_dec = unquote(u)
+                        idx = raw_dec.lower().find(first_low)
+                        orig_slice = raw_dec[idx : idx + len(first["name"])]
+                        if quote(orig_slice, safe="") in u:
+                            discovered_api = u.replace(quote(orig_slice, safe=""), "{NAME}")
+                        elif orig_slice in u:
+                            discovered_api = u.replace(orig_slice, "{NAME}")
             except Exception:
                 pass
 
-    # Fallback path: lightweight Playwright lookup for any remaining players
-    still_missing = [p for p in remaining if parse_duration_seconds(p.get("total")) is None]
-    if still_missing:
-        page = context.new_page()
-        page.route("**/*", block_heavy)
+        probe_page.on("response", lambda r: asyncio.create_task(handle_probe_resp(r)))
         try:
-            for p in still_missing:
-                try:
-                    p_json = []
+            await probe_page.goto(build_profile_url(first), wait_until="domcontentloaded", timeout=15000)
+            try:
+                await probe_page.wait_for_function(
+                    "() => document.querySelectorAll('a[href*=\"server.html\"]').length > 0 || /servers\\s+visited/i.test(document.body.innerText)",
+                    timeout=6000,
+                )
+            except Exception:
+                pass
+            await probe_page.wait_for_timeout(400)
 
-                    def capture_p(resp, bucket=p_json):
-                        try:
-                            if "json" in resp.headers.get("content-type", "").lower():
-                                bucket.append(resp.json())
-                        except Exception:
-                            pass
+            loaded_j, tot = extract_server_total_from_player_json(first_json, server_id, server_name, base_name)
+            loaded_d = False
+            if tot is None:
+                loaded_d, tot = await extract_server_total_from_player_dom(probe_page, server_id, server_name, base_name)
+            if tot is None:
+                tot = extract_server_total_from_player_text(await probe_page.locator("body").inner_text(), server_name, base_name)
 
-                    page.on("response", capture_p)
-                    page.goto(build_profile_url(p), wait_until="domcontentloaded", timeout=15000)
+            secs = parse_duration_seconds(tot)
+            if secs is not None:
+                record_total(first, secs)
+            elif loaded_j or loaded_d:
+                record_total(first, 0)
+        except Exception as e:
+            print(f"Probe error for {first['name']}: {e}")
+        finally:
+            await probe_page.close()
+
+        to_fetch = [p for p in to_fetch if parse_duration_seconds(p.get("total")) is None]
+
+        # If probe discovered a working JSON API, burst-fetch all remaining players via HTTP threads!
+        if discovered_api and to_fetch:
+            save_api_cache(server_id, discovered_api)
+            hits = fetch_via_http_api_batch(discovered_api, to_fetch, server_id, server_name, base_name)
+            for p in to_fetch:
+                secs = hits.get(p["name"].lower())
+                if secs is not None:
+                    record_total(p, secs)
+            to_fetch = [p for p in to_fetch if parse_duration_seconds(p.get("total")) is None]
+
+    # Fast Path C: Fetch any remaining players in parallel using 5 lightweight Playwright tabs + hard time budget
+    if to_fetch and (time.monotonic() - t_start) < ENRICH_TIME_BUDGET_SECONDS:
+        print(f"Fetching {len(to_fetch)} player profiles concurrently ({PROFILE_CONCURRENCY} tabs)...")
+        sem = asyncio.Semaphore(PROFILE_CONCURRENCY)
+
+        async def fetch_tab(p):
+            if (time.monotonic() - t_start) >= ENRICH_TIME_BUDGET_SECONDS:
+                return
+            async with sem:
+                if (time.monotonic() - t_start) >= ENRICH_TIME_BUDGET_SECONDS:
+                    return
+                page = await context.new_page()
+                await page.route("**/*", block_heavy_assets)
+                p_json = []
+
+                async def cap(resp):
                     try:
-                        page.wait_for_function(
+                        if "json" in resp.headers.get("content-type", "").lower():
+                            data = await resp.json()
+                            if looks_like_player_profile_json(data):
+                                p_json.append(data)
+                    except Exception:
+                        pass
+
+                page.on("response", lambda r: asyncio.create_task(cap(r)))
+                try:
+                    await page.goto(build_profile_url(p), wait_until="domcontentloaded", timeout=12000)
+                    try:
+                        await page.wait_for_function(
                             "() => document.querySelectorAll('a[href*=\"server.html\"]').length > 0 || /last\\s+active/i.test(document.body.innerText)",
-                            timeout=6000,
+                            timeout=5000,
                         )
                     except Exception:
                         pass
-                    page.wait_for_timeout(300)
-                    page.remove_listener("response", capture_p)
-
-                    loaded_j, tot = extract_server_total_from_player_json(
-                        p_json, server_id, server_name, base_name
-                    )
+                    await page.wait_for_timeout(250)
+                    loaded_j, tot = extract_server_total_from_player_json(p_json, server_id, server_name, base_name)
                     loaded_d = False
                     if tot is None:
-                        loaded_d, tot = extract_server_total_from_player_dom(
-                            page, server_id, server_name, base_name
-                        )
+                        loaded_d, tot = await extract_server_total_from_player_dom(page, server_id, server_name, base_name)
                     if tot is None:
-                        tot = extract_server_total_from_player_text(
-                            page.locator("body").inner_text(), server_name, base_name
-                        )
-                    if tot is not None:
-                        p["total"] = tot
+                        tot = extract_server_total_from_player_text(await page.locator("body").inner_text(), server_name, base_name)
+                    secs = parse_duration_seconds(tot)
+                    if secs is not None:
+                        record_total(p, secs)
                     elif loaded_j or loaded_d:
-                        p["total"] = 0
+                        record_total(p, 0)
                 except Exception:
                     pass
-        finally:
-            page.close()
+                finally:
+                    await page.close()
+
+        await asyncio.gather(*(fetch_tab(p) for p in to_fetch))
+
+    # If time budget cut off a stale refresh, preserve their previous cached value instead of showing --:--:--
+    for p in players:
+        if parse_duration_seconds(p.get("total")) is None:
+            fb = stale_fallbacks.get(p["name"].lower())
+            if fb is not None:
+                p["total"] = fb
+
+    print(f"Profile enrichment finished in {time.monotonic() - t_start:.1f}s.")
+    return cache_dirty
 
 
 def extract_detail_fields_from_text(full_text: str) -> dict:
@@ -995,12 +1138,13 @@ def extract_detail_fields_from_text(full_text: str) -> dict:
     return info
 
 
-def find_server_page_url(page, target_norm: str) -> str:
-    if SERVER_PAGE_URL.strip():
-        return SERVER_PAGE_URL.strip()
-
-    page.goto(TARGET_URL, wait_until="networkidle", timeout=45000)
-    page.wait_for_timeout(3500)
+async def discover_server_url_fallback(page, target_norm: str) -> str:
+    await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+    try:
+        await page.wait_for_function("() => document.querySelectorAll('a[href*=\"server.html\"]').length > 0", timeout=10000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(1200)
 
     js = r"""(targetNorm) => {
       const norm = s => (s || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
@@ -1019,105 +1163,126 @@ def find_server_page_url(page, target_norm: str) -> str:
       return candidates.length ? candidates[0].href : null;
     }"""
     try:
-        href = page.evaluate(js, target_norm)
+        href = await page.evaluate(js, target_norm)
         if href:
             return urljoin(TARGET_URL, href)
     except Exception:
         pass
+    return SERVER_PAGE_URL
 
-    return FALLBACK_SERVER_URL
 
-
-def fetch_server_status() -> dict:
+async def fetch_server_status_async() -> dict:
+    t0 = time.monotonic()
     target_norm = normalize_name(SERVER_NAME)
     captured_json = []
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        context = browser.new_context()
-        page = context.new_page()
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.route("**/*", block_heavy_assets)
 
-        server_url = find_server_page_url(page, target_norm)
+        server_url = SERVER_PAGE_URL.strip()
+        if not server_url:
+            server_url = await discover_server_url_fallback(page, target_norm)
         server_id = extract_server_id(server_url)
 
-        def handle_response(response):
+        async def handle_response(response):
             try:
                 ctype = response.headers.get("content-type", "")
                 if "json" in ctype.lower():
-                    captured_json.append(response.json())
+                    captured_json.append(await response.json())
             except Exception:
                 pass
 
-        page.on("response", handle_response)
-        page.goto(server_url, wait_until="networkidle", timeout=45000)
+        page.on("response", lambda r: asyncio.create_task(handle_response(r)))
 
-        try:
-            page.wait_for_function(
-                "() => !document.body.innerText.includes('LOADING SERVER TELEMETRY')",
-                timeout=15000,
-            )
-        except Exception:
-            pass
-        page.wait_for_timeout(4000)
+        # Navigate directly to server.html?id=... with 1 automatic retry
+        loaded_ok = False
+        for attempt in range(2):
+            try:
+                await page.goto(server_url, wait_until="domcontentloaded", timeout=25000)
+                await page.wait_for_function(
+                    "() => !document.body.innerText.includes('LOADING SERVER TELEMETRY') && (/active\\s+players/i.test(document.body.innerText) || /server\\s+details/i.test(document.body.innerText))",
+                    timeout=15000,
+                )
+                loaded_ok = True
+                break
+            except Exception as e:
+                print(f"Server page attempt {attempt + 1} slow/failed: {e}")
+                if attempt == 0:
+                    await page.wait_for_timeout(1500)
 
-        dom_players, sample_raw = extract_active_players_from_dom(page)
-        full_text = page.locator("body").inner_text()
+        if loaded_ok:
+            await page.wait_for_timeout(1200)
 
+        dom_players, sample_raw = await extract_active_players_from_dom(page)
+        full_text = await page.locator("body").inner_text()
         parsed = extract_detail_fields_from_text(full_text)
+
+        # If header shows >0 players but active player rows are still hydrating, wait briefly and re-read
+        if (parsed["current"] or 0) > 0 and not dom_players:
+            await page.wait_for_timeout(3000)
+            dom_players, sample_raw = await extract_active_players_from_dom(page)
+            full_text = await page.locator("body").inner_text()
+            parsed = extract_detail_fields_from_text(full_text)
+
         json_players = extract_active_players_from_json(captured_json)
         leaders_map = extract_duration_leaders_map(full_text)
 
-        if sample_raw:
-            print(f"Row 1 sample: {sample_raw}")
-
         if dom_players:
-            json_by_name = {p["name"].lower(): p for p in json_players}
+            json_by_name = {pl["name"].lower(): pl for pl in json_players}
             players = []
-            for p in dom_players:
-                low = p["name"].lower()
+            for pl in dom_players:
+                low = pl["name"].lower()
                 jp = json_by_name.get(low, {})
-                session = p["session"] if p["session"] is not None else jp.get("session")
-                total = p["total"] if p["total"] is not None else jp.get("total")
+                session = pl["session"] if pl["session"] is not None else jp.get("session")
+                total = pl["total"] if pl["total"] is not None else jp.get("total")
                 players.append({
-                    "name": p["name"],
-                    "href": p.get("href"),
+                    "name": pl["name"],
+                    "href": pl.get("href"),
                     "session": session,
                     "total": total,
                     "session_secs": parse_duration_seconds(session),
                 })
         else:
             players = []
-            for p in json_players:
+            for pl in json_players:
                 players.append({
-                    "name": p["name"],
-                    "href": p.get("href"),
-                    "session": p["session"],
-                    "total": p["total"],
-                    "session_secs": parse_duration_seconds(p["session"]),
+                    "name": pl["name"],
+                    "href": pl.get("href"),
+                    "session": pl["session"],
+                    "total": pl["total"],
+                    "session_secs": parse_duration_seconds(pl["session"]),
                 })
 
-        if any(p["session_secs"] is not None for p in players):
+        if any(pl["session_secs"] is not None for pl in players):
             players.sort(
-                key=lambda p: (p["session_secs"] if p["session_secs"] is not None else -1),
+                key=lambda pl: (pl["session_secs"] if pl["session_secs"] is not None else -1),
                 reverse=True,
             )
 
         players = players[:MAX_PLAYERS_SHOWN]
-
         display_server_name = parsed["name"] or SERVER_NAME
-        if players and any(parse_duration_seconds(pl.get("total")) is None for pl in players):
-            enrich_missing_totals_via_player_profiles(
-                context, players, server_id, display_server_name, SERVER_NAME
-            )
 
-        # Secondary fallback: Duration Leaders Top 20 on this exact server page
+        totals_cache = load_totals_cache(server_id)
+        api_cache = load_api_cache(server_id)
+
+        if players:
+            cache_dirty = await enrich_missing_totals_fast(
+                context, players, totals_cache, api_cache, server_id, display_server_name, SERVER_NAME
+            )
+            if cache_dirty:
+                save_totals_cache(totals_cache)
+
+        # Fallback: Duration Leaders Top 20 on this exact server page
         for pl in players:
             if parse_duration_seconds(pl.get("total")) is None:
-                fallback_tot = leaders_map.get(pl["name"].lower())
-                if fallback_tot is not None:
-                    pl["total"] = fallback_tot
+                fb = leaders_map.get(pl["name"].lower())
+                if fb is not None:
+                    pl["total"] = fb
 
-        browser.close()
+        await browser.close()
 
     current = parsed["current"] if parsed["current"] is not None else len(players)
     maximum = parsed["maximum"] if parsed["maximum"] is not None else 24
@@ -1126,6 +1291,7 @@ def fetch_server_status() -> dict:
         players = []
 
     found = parsed["online"] is not False and (parsed["online"] is True or parsed["maximum"] is not None)
+    print(f"Total scrape time: {time.monotonic() - t0:.1f}s ({current}/{maximum} players)")
 
     return {
         "found": found,
@@ -1143,9 +1309,9 @@ def build_ansi_roster_table(players: list) -> str:
     # Pure bright white (#FFFFFF) with 97m bright-white + 1;37m bold-white fallback
     BRIGHT_WHITE = f"{ESC}[1;37m{ESC}[97m{ESC}[38;2;255;255;255m"
     YELLOW_1ST = f"{ESC}[1;33m{ESC}[38;2;220;178;60m"     # 1st place: Gold/Yellow text
-    GRAY_2ND = f"{ESC}[0;37m{ESC}[38;2;152;158;168m"      # 2nd place: Silver/Gray text (distinct from bright white)
+    GRAY_2ND = f"{ESC}[0;37m{ESC}[38;2;152;158;168m"      # 2nd place: Silver/Gray text
     ORANGE_3RD = f"{ESC}[1;31m{ESC}[38;2;215;118;62m"     # 3rd place: Bronze/Orange text
-    DIVIDER = f"{ESC}[0;37m"                              # Subtle light-gray separator line
+    DIVIDER = f"{ESC}[0;37m"
 
     # Total visible width = 4 + 1 + 16 + 1 + 8 + 1 + 9 = 40 chars (never wraps in Discord embeds)
     header = f"{BRIGHT_WHITE}{'Rank':<4} {'Player':<16} {'Session':>8} {'Total':>9}{RESET}"
@@ -1176,13 +1342,12 @@ def build_ansi_roster_table(players: list) -> str:
             elif rank == 3:
                 lines.append(f"{left_pad}{ORANGE_3RD}{raw_badge}{RESET} {BRIGHT_WHITE}{row_body}{RESET}")
             else:
-                # Ranks 4th-24th + Player Name + Session + Total all in one bright white span
                 lines.append(f"{left_pad}{BRIGHT_WHITE}{raw_badge} {row_body}{RESET}")
 
     return "```ansi\n" + "\n".join(lines) + "\n```"
 
 
-def build_embed(info: dict, thumbnail_url: str = None) -> dict:
+def build_embed(info: dict, thumbnail_url: str = THUMBNAIL_URL) -> dict:
     found = info["found"]
     current = info["current"]
     maximum = info["maximum"]
@@ -1233,19 +1398,32 @@ def build_embed(info: dict, thumbnail_url: str = None) -> dict:
     return {"embeds": [embed]}
 
 
+def send_discord_request(method: str, url: str, payload: dict):
+    for attempt in range(3):
+        res = requests.request(method, url, json=payload, timeout=20)
+        if res.status_code == 429:
+            retry_after = float(res.json().get("retry_after", 2))
+            time.sleep(min(retry_after, 10))
+            continue
+        if res.status_code >= 500 and attempt < 2:
+            time.sleep(2)
+            continue
+        return res
+    return res
+
+
 def main():
     webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
     if not is_valid_webhook(webhook_url):
         print("ERROR: Missing or invalid DISCORD_WEBHOOK_URL secret.")
         sys.exit(1)
 
-    info = fetch_server_status()
-    thumb = pick_working_thumbnail()
-    payload = build_embed(info, thumbnail_url=thumb)
+    info = asyncio.run(fetch_server_status_async())
+    payload = build_embed(info)
     message_id = load_message_id()
 
     if message_id:
-        res = requests.patch(f"{webhook_url}/messages/{message_id}", json=payload, timeout=20)
+        res = send_discord_request("PATCH", f"{webhook_url}/messages/{message_id}", payload)
         if res.status_code == 404:
             print("Previous Discord card was deleted. Posting a new one...")
             message_id = None
@@ -1258,7 +1436,7 @@ def main():
             )
 
     if not message_id:
-        res = requests.post(f"{webhook_url}?wait=true", json=payload, timeout=20)
+        res = send_discord_request("POST", f"{webhook_url}?wait=true", payload)
         res.raise_for_status()
         new_id = res.json()["id"]
         save_message_id(new_id)
