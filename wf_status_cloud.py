@@ -1,4 +1,5 @@
 import asyncio
+import html
 import json
 import os
 import re
@@ -24,6 +25,7 @@ PROFILE_CONCURRENCY = 5           # Fetch up to 5 player profiles at once in Pla
 ENRICH_TIME_BUDGET_SECONDS = 45   # Never let profile lookups delay or time out the Discord update
 
 THUMBNAIL_URL = "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/228380/header.jpg"
+ROSTER_IMAGE_FILENAME = "roster.png"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1282,16 +1284,18 @@ async def fetch_server_status_async() -> dict:
                 if fb is not None:
                     pl["total"] = fb
 
+        current = parsed["current"] if parsed["current"] is not None else len(players)
+        maximum = parsed["maximum"] if parsed["maximum"] is not None else 24
+
+        if current == 0:
+            players = []
+
+        roster_png_path = os.path.join(BASE_DIR, ROSTER_IMAGE_FILENAME)
+        has_roster_png = await render_roster_png_async(browser, players, roster_png_path)
         await browser.close()
 
-    current = parsed["current"] if parsed["current"] is not None else len(players)
-    maximum = parsed["maximum"] if parsed["maximum"] is not None else 24
-
-    if current == 0:
-        players = []
-
     found = parsed["online"] is not False and (parsed["online"] is True or parsed["maximum"] is not None)
-    print(f"Total scrape time: {time.monotonic() - t0:.1f}s ({current}/{maximum} players)")
+    print(f"Total scrape time: {time.monotonic() - t0:.1f}s ({current}/{maximum} players, png={has_roster_png})")
 
     return {
         "found": found,
@@ -1300,54 +1304,211 @@ async def fetch_server_status_async() -> dict:
         "current": current,
         "maximum": maximum,
         "players": players,
+        "roster_png_path": roster_png_path if has_roster_png else None,
     }
 
 
-def build_ansi_roster_table(players: list) -> str:
-    ESC = "\u001b"
-    RESET = f"{ESC}[0m"
-    # Pure bright white (#FFFFFF) with 97m bright-white + 1;37m bold-white fallback
-    BRIGHT_WHITE = f"{ESC}[1;37m{ESC}[97m{ESC}[38;2;255;255;255m"
-    YELLOW_1ST = f"{ESC}[1;33m{ESC}[38;2;220;178;60m"     # 1st place: Gold/Yellow text
-    GRAY_2ND = f"{ESC}[0;37m{ESC}[38;2;152;158;168m"      # 2nd place: Silver/Gray text
-    ORANGE_3RD = f"{ESC}[1;31m{ESC}[38;2;215;118;62m"     # 3rd place: Bronze/Orange text
-    DIVIDER = f"{ESC}[0;37m"
-
-    # Total visible width = 4 + 1 + 16 + 1 + 8 + 1 + 9 = 40 chars (never wraps in Discord embeds)
-    header = f"{BRIGHT_WHITE}{'Rank':<4} {'Player':<16} {'Session':>8} {'Total':>9}{RESET}"
-    divider = f"{DIVIDER}{'─' * 40}{RESET}"
-    lines = [header, divider]
-
+def build_roster_html(players: list) -> str:
+    rows_html = []
     if not players:
-        lines.append(f"{BRIGHT_WHITE}   No active players online right now{RESET}")
+        rows_html.append(
+            '<div class="empty-row">No active players online right now</div>'
+        )
     else:
         for rank, p in enumerate(players[:MAX_PLAYERS_SHOWN], start=1):
-            raw_badge = f"[{rank}]"
-            left_pad = " " * (4 - len(raw_badge))
-
-            raw_name = p["name"].replace("`", "'")
-            if len(raw_name) > 16:
-                display_name = raw_name[:15] + "…"
-            else:
-                display_name = raw_name
-
-            sess = format_session_time(p.get("session"))
-            tot = format_total_time(p.get("total"))
-            row_body = f"{display_name:<16} {sess:>8} {tot:>9}"
-
             if rank == 1:
-                lines.append(f"{left_pad}{YELLOW_1ST}{raw_badge}{RESET} {BRIGHT_WHITE}{row_body}{RESET}")
+                rank_cls = "rank-1"
             elif rank == 2:
-                lines.append(f"{left_pad}{GRAY_2ND}{raw_badge}{RESET} {BRIGHT_WHITE}{row_body}{RESET}")
+                rank_cls = "rank-2"
             elif rank == 3:
-                lines.append(f"{left_pad}{ORANGE_3RD}{raw_badge}{RESET} {BRIGHT_WHITE}{row_body}{RESET}")
+                rank_cls = "rank-3"
             else:
-                lines.append(f"{left_pad}{BRIGHT_WHITE}{raw_badge} {row_body}{RESET}")
+                rank_cls = "rank-std"
 
-    return "```ansi\n" + "\n".join(lines) + "\n```"
+            raw_name = str(p.get("name") or "").strip()
+            if len(raw_name) > 22:
+                raw_name = raw_name[:21] + "…"
+            safe_name = html.escape(raw_name)
+            sess = html.escape(format_session_time(p.get("session")))
+            tot = html.escape(format_total_time(p.get("total")))
+
+            rows_html.append(
+                f'<div class="row">'
+                f'<div class="col-rank"><span class="badge {rank_cls}">[{rank}]</span></div>'
+                f'<div class="col-name">{safe_name}</div>'
+                f'<div class="col-sess">{sess}</div>'
+                f'<div class="col-tot">{tot}</div>'
+                f'</div>'
+            )
+
+    body_rows = "\n".join(rows_html)
+    return f"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8" />
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{
+    background: #2b2d31;
+    font-family: 'Liberation Sans', 'DejaVu Sans', Arial, sans-serif;
+    color: #ffffff;
+    width: 560px;
+  }}
+  #roster-card {{
+    width: 560px;
+    background: #1e1f22;
+    border: 1px solid #383a40;
+    border-radius: 8px;
+    overflow: hidden;
+  }}
+  .header {{
+    display: flex;
+    align-items: center;
+    padding: 9px 14px;
+    background: #17181b;
+    border-bottom: 1px solid #32343a;
+    font-family: 'Liberation Mono', 'DejaVu Sans Mono', monospace;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.5px;
+    color: #b5bac1;
+    text-transform: uppercase;
+  }}
+  .row {{
+    display: flex;
+    align-items: center;
+    padding: 6px 14px;
+    border-bottom: 1px solid #26282d;
+    font-size: 14px;
+    line-height: 1.25;
+  }}
+  .row:nth-child(even) {{
+    background: #222428;
+  }}
+  .row:last-child {{
+    border-bottom: none;
+  }}
+  .col-rank {{
+    width: 58px;
+    flex-shrink: 0;
+    font-family: 'Liberation Mono', 'DejaVu Sans Mono', monospace;
+    font-size: 13px;
+    font-weight: 700;
+  }}
+  .badge {{
+    display: inline-block;
+    min-width: 40px;
+    text-align: center;
+    padding: 2px 5px;
+    border-radius: 4px;
+  }}
+  .rank-1 {{
+    color: #f5c542;
+    background: rgba(245, 197, 66, 0.14);
+    border: 1px solid rgba(245, 197, 66, 0.45);
+  }}
+  .rank-2 {{
+    color: #c5cbd3;
+    background: rgba(197, 203, 211, 0.14);
+    border: 1px solid rgba(197, 203, 211, 0.40);
+  }}
+  .rank-3 {{
+    color: #e8833a;
+    background: rgba(232, 131, 58, 0.14);
+    border: 1px solid rgba(232, 131, 58, 0.45);
+  }}
+  .rank-std {{
+    color: #ffffff;
+    background: #2b2d31;
+    border: 1px solid #3a3d44;
+  }}
+  .col-name {{
+    flex: 1;
+    min-width: 0;
+    padding-right: 10px;
+    font-weight: 600;
+    color: #ffffff;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }}
+  .col-sess {{
+    width: 96px;
+    flex-shrink: 0;
+    text-align: right;
+    font-family: 'Liberation Mono', 'DejaVu Sans Mono', monospace;
+    font-size: 13.5px;
+    font-weight: 600;
+    color: #ffffff;
+  }}
+  .col-tot {{
+    width: 106px;
+    flex-shrink: 0;
+    text-align: right;
+    font-family: 'Liberation Mono', 'DejaVu Sans Mono', monospace;
+    font-size: 13.5px;
+    font-weight: 600;
+    color: #ffffff;
+  }}
+  .empty-row {{
+    padding: 18px 14px;
+    text-align: center;
+    color: #b5bac1;
+    font-size: 14px;
+  }}
+</style>
+</head>
+<body>
+  <div id="roster-card">
+    <div class="header">
+      <div class="col-rank">Rank</div>
+      <div class="col-name">Player</div>
+      <div class="col-sess">Session</div>
+      <div class="col-tot">Total</div>
+    </div>
+    {body_rows}
+  </div>
+</body>
+</html>"""
 
 
-def build_embed(info: dict, thumbnail_url: str = THUMBNAIL_URL) -> dict:
+async def render_roster_png_async(browser, players: list, out_path: str) -> bool:
+    """Render a crisp 2x retina PNG table so Desktop and Mobile Discord look identical."""
+    try:
+        ctx = await browser.new_context(
+            viewport={"width": 600, "height": 1200},
+            device_scale_factor=2,
+        )
+        page = await ctx.new_page()
+        await page.set_content(build_roster_html(players), wait_until="domcontentloaded")
+        card = page.locator("#roster-card")
+        await card.screenshot(path=out_path, type="png")
+        await ctx.close()
+        return os.path.exists(out_path) and os.path.getsize(out_path) > 0
+    except Exception as e:
+        print(f"Roster PNG render fallback triggered: {e}")
+        return False
+
+
+def build_mobile_safe_text_fallback(players: list) -> str:
+    """32-char plain monospace fallback (no ANSI codes) if PNG rendering ever fails."""
+    lines = [f"{'#':<3} {'Player':<13} {'Sess':>6} {'Total':>7}", "-" * 32]
+    if not players:
+        lines.append("  No active players online")
+    else:
+        for rank, p in enumerate(players[:MAX_PLAYERS_SHOWN], start=1):
+            r_str = f"{rank}."
+            nm = p["name"].replace("`", "'")
+            nm = (nm[:12] + "…") if len(nm) > 13 else nm
+            s_full = format_session_time(p.get("session"))
+            s_short = s_full[:5] if s_full != "--:--:--" else "--:--"
+            t_full = format_total_time(p.get("total"))
+            t_short = t_full[:-3] if len(t_full) >= 8 and t_full != "--:--:--" else "--:--"
+            lines.append(f"{r_str:<3} {nm:<13} {s_short:>6} {t_short:>7}")
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
+def build_embed(info: dict, thumbnail_url: str = THUMBNAIL_URL, use_image: bool = True, is_patch: bool = False) -> dict:
     found = info["found"]
     current = info["current"]
     maximum = info["maximum"]
@@ -1369,14 +1530,14 @@ def build_embed(info: dict, thumbnail_url: str = THUMBNAIL_URL) -> dict:
         bar = make_progress_bar(0, maximum)
 
     roster_heading = f"**Active Players ({current}/{maximum})**" if maximum else f"**Active Players ({current})**"
-    table_block = build_ansi_roster_table(players)
 
     desc_parts = [f"**{status_line}**"]
     if bar:
         desc_parts.append(bar)
     desc_parts.append("")
     desc_parts.append(roster_heading)
-    desc_parts.append(table_block)
+    if not use_image:
+        desc_parts.append(build_mobile_safe_text_fallback(players))
     description = "\n".join(desc_parts)
 
     embed = {
@@ -1395,12 +1556,35 @@ def build_embed(info: dict, thumbnail_url: str = THUMBNAIL_URL) -> dict:
     if thumbnail_url:
         embed["thumbnail"] = {"url": thumbnail_url}
 
-    return {"embeds": [embed]}
+    payload = {"embeds": [embed]}
+    if use_image:
+        embed["image"] = {"url": f"attachment://{ROSTER_IMAGE_FILENAME}"}
+        # On PATCH, attachments=[] clears the old PNG and replaces it with files[0] cleanly
+        payload["attachments"] = [] if is_patch else [{"id": 0, "filename": ROSTER_IMAGE_FILENAME}]
+    elif is_patch:
+        payload["attachments"] = []
+
+    return payload
 
 
-def send_discord_request(method: str, url: str, payload: dict):
+def send_discord_request(method: str, url: str, payload: dict, image_path: str = None):
+    img_bytes = None
+    if image_path and os.path.exists(image_path):
+        with open(image_path, "rb") as f:
+            img_bytes = f.read()
+
     for attempt in range(3):
-        res = requests.request(method, url, json=payload, timeout=20)
+        if img_bytes is not None:
+            res = requests.request(
+                method,
+                url,
+                data={"payload_json": json.dumps(payload)},
+                files={"files[0]": (ROSTER_IMAGE_FILENAME, img_bytes, "image/png")},
+                timeout=25,
+            )
+        else:
+            res = requests.request(method, url, json=payload, timeout=20)
+
         if res.status_code == 429:
             retry_after = float(res.json().get("retry_after", 2))
             time.sleep(min(retry_after, 10))
@@ -1419,28 +1603,39 @@ def main():
         sys.exit(1)
 
     info = asyncio.run(fetch_server_status_async())
-    payload = build_embed(info)
+    png_path = info.get("roster_png_path")
+    use_img = bool(png_path and os.path.exists(png_path))
     message_id = load_message_id()
 
-    if message_id:
-        res = send_discord_request("PATCH", f"{webhook_url}/messages/{message_id}", payload)
-        if res.status_code == 404:
-            print("Previous Discord card was deleted. Posting a new one...")
-            message_id = None
-        else:
-            res.raise_for_status()
-            with_totals = sum(1 for pl in info["players"] if parse_duration_seconds(pl.get("total")) is not None)
-            print(
-                f"Updated card: {info['current']}/{info['maximum']} players "
-                f"({len(info['players'])} listed, {with_totals} with Get ReKt420 Total)"
-            )
+    try:
+        if message_id:
+            payload = build_embed(info, use_image=use_img, is_patch=True)
+            res = send_discord_request("PATCH", f"{webhook_url}/messages/{message_id}", payload, png_path if use_img else None)
+            if res.status_code == 404:
+                print("Previous Discord card was deleted. Posting a new one...")
+                message_id = None
+            else:
+                res.raise_for_status()
+                with_totals = sum(1 for pl in info["players"] if parse_duration_seconds(pl.get("total")) is not None)
+                print(
+                    f"Updated card: {info['current']}/{info['maximum']} players "
+                    f"({len(info['players'])} listed, {with_totals} with Get ReKt420 Total, mobile_png={use_img})"
+                )
 
-    if not message_id:
-        res = send_discord_request("POST", f"{webhook_url}?wait=true", payload)
-        res.raise_for_status()
-        new_id = res.json()["id"]
-        save_message_id(new_id)
-        print(f"Posted new live Discord card! Message ID saved: {new_id}")
+        if not message_id:
+            payload = build_embed(info, use_image=use_img, is_patch=False)
+            res = send_discord_request("POST", f"{webhook_url}?wait=true", payload, png_path if use_img else None)
+            res.raise_for_status()
+            new_id = res.json()["id"]
+            save_message_id(new_id)
+            print(f"Posted new live Discord card! Message ID saved: {new_id}")
+    finally:
+        # Remove temporary PNG so git commit step never bloats the repository
+        if png_path and os.path.exists(png_path):
+            try:
+                os.remove(png_path)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
