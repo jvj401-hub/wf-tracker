@@ -1140,33 +1140,24 @@ def fetch_server_status() -> dict:
 def build_ansi_roster_table(players: list) -> str:
     ESC = "\u001b"
     RESET = f"{ESC}[0m"
-    HEADER = f"{ESC}[1;37m"                         # Bold white header
-    YELLOW_1ST = f"{ESC}[1;33m{ESC}[38;2;220;178;60m"    # 1st place: Gold/Yellow text (no background box)
-    GRAY_2ND = f"{ESC}[1;37m{ESC}[38;2;152;158;168m"     # 2nd place: Silver/Gray text (no background box)
-    ORANGE_3RD = f"{ESC}[1;31m{ESC}[38;2;215;118;62m"    # 3rd place: Bronze/Orange text (no background box)
-    LEGIBLE_RANK = f"{ESC}[0;37m"                        # 4th-24th: White matching player names
-    ROW_TEXT = f"{ESC}[0;37m"                            # White text for names, session, total
-    DIVIDER = f"{ESC}[0;37m"
+    # Pure bright white (#FFFFFF) with 97m bright-white + 1;37m bold-white fallback
+    BRIGHT_WHITE = f"{ESC}[1;37m{ESC}[97m{ESC}[38;2;255;255;255m"
+    YELLOW_1ST = f"{ESC}[1;33m{ESC}[38;2;220;178;60m"     # 1st place: Gold/Yellow text
+    GRAY_2ND = f"{ESC}[0;37m{ESC}[38;2;152;158;168m"      # 2nd place: Silver/Gray text (distinct from bright white)
+    ORANGE_3RD = f"{ESC}[1;31m{ESC}[38;2;215;118;62m"     # 3rd place: Bronze/Orange text
+    DIVIDER = f"{ESC}[0;37m"                              # Subtle light-gray separator line
 
     # Total visible width = 4 + 1 + 16 + 1 + 8 + 1 + 9 = 40 chars (never wraps in Discord embeds)
-    header = f"{HEADER}{'Rank':<4} {'Player':<16} {'Session':>8} {'Total':>9}{RESET}"
+    header = f"{BRIGHT_WHITE}{'Rank':<4} {'Player':<16} {'Session':>8} {'Total':>9}{RESET}"
     divider = f"{DIVIDER}{'─' * 40}{RESET}"
     lines = [header, divider]
 
     if not players:
-        lines.append(f"{ROW_TEXT}   No active players online right now{RESET}")
+        lines.append(f"{BRIGHT_WHITE}   No active players online right now{RESET}")
     else:
         for rank, p in enumerate(players[:MAX_PLAYERS_SHOWN], start=1):
             raw_badge = f"[{rank}]"
             left_pad = " " * (4 - len(raw_badge))
-            if rank == 1:
-                badge = f"{left_pad}{YELLOW_1ST}{raw_badge}{RESET}"
-            elif rank == 2:
-                badge = f"{left_pad}{GRAY_2ND}{raw_badge}{RESET}"
-            elif rank == 3:
-                badge = f"{left_pad}{ORANGE_3RD}{raw_badge}{RESET}"
-            else:
-                badge = f"{left_pad}{LEGIBLE_RANK}{raw_badge}{RESET}"
 
             raw_name = p["name"].replace("`", "'")
             if len(raw_name) > 16:
@@ -1176,7 +1167,17 @@ def build_ansi_roster_table(players: list) -> str:
 
             sess = format_session_time(p.get("session"))
             tot = format_total_time(p.get("total"))
-            lines.append(f"{badge} {ROW_TEXT}{display_name:<16} {sess:>8} {tot:>9}{RESET}")
+            row_body = f"{display_name:<16} {sess:>8} {tot:>9}"
+
+            if rank == 1:
+                lines.append(f"{left_pad}{YELLOW_1ST}{raw_badge}{RESET} {BRIGHT_WHITE}{row_body}{RESET}")
+            elif rank == 2:
+                lines.append(f"{left_pad}{GRAY_2ND}{raw_badge}{RESET} {BRIGHT_WHITE}{row_body}{RESET}")
+            elif rank == 3:
+                lines.append(f"{left_pad}{ORANGE_3RD}{raw_badge}{RESET} {BRIGHT_WHITE}{row_body}{RESET}")
+            else:
+                # Ranks 4th-24th + Player Name + Session + Total all in one bright white span
+                lines.append(f"{left_pad}{BRIGHT_WHITE}{raw_badge} {row_body}{RESET}")
 
     return "```ansi\n" + "\n".join(lines) + "\n```"
 
