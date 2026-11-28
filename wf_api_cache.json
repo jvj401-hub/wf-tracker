@@ -1,0 +1,4 @@
+{
+  "server_id": "309494",
+  "player_api_template": "https://www.wfservers.com/api/playerview/?name={NAME}"
+}
