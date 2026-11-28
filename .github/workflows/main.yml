@@ -24,14 +24,13 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          cache: 'pip'
 
       - name: Install Python packages
         run: python -m pip install --quiet requests playwright
 
       - name: Get Playwright version
         id: pw-ver
-        run: echo "ver=$(python -c 'import importlib.metadata; print(importlib.metadata.version(\"playwright\"))')" >> $GITHUB_OUTPUT
+        run: python -c "import importlib.metadata; print('ver=' + importlib.metadata.version('playwright'))" >> "$GITHUB_OUTPUT"
 
       - name: Cache Chromium browser
         id: pw-cache
