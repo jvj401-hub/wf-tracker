@@ -1141,11 +1141,11 @@ def build_ansi_roster_table(players: list) -> str:
     ESC = "\u001b"
     RESET = f"{ESC}[0m"
     HEADER = f"{ESC}[1;37m"                         # Bold white header
-    YELLOW_1ST = f"{ESC}[1;33m"                     # 1st place: Yellow
-    GRAY_2ND = f"{ESC}[1;30;47m{ESC}[48;2;154;160;170m"  # 2nd place: True silver-gray badge (47 = Light Gray fallback)
-    ORANGE_3RD = f"{ESC}[1;37;41m{ESC}[48;2;217;119;6m"  # 3rd place: Orange badge
-    LEGIBLE_RANK = f"{ESC}[0;37m"                   # 4th-24th: Clean readable light gray
-    ROW_TEXT = f"{ESC}[0;37m"                       # Clean readable light gray text
+    YELLOW_1ST = f"{ESC}[1;33m{ESC}[38;2;220;178;60m"    # 1st place: Gold/Yellow text (no background box)
+    GRAY_2ND = f"{ESC}[1;37m{ESC}[38;2;152;158;168m"     # 2nd place: Silver/Gray text (no background box)
+    ORANGE_3RD = f"{ESC}[1;31m{ESC}[38;2;215;118;62m"    # 3rd place: Bronze/Orange text (no background box)
+    LEGIBLE_RANK = f"{ESC}[0;37m"                        # 4th-24th: White matching player names
+    ROW_TEXT = f"{ESC}[0;37m"                            # White text for names, session, total
     DIVIDER = f"{ESC}[0;37m"
 
     # Total visible width = 4 + 1 + 16 + 1 + 8 + 1 + 9 = 40 chars (never wraps in Discord embeds)
